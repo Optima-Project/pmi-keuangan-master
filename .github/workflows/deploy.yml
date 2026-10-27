@@ -1,0 +1,174 @@
+name: Deploy Laravel to Hostinger
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      fresh_db:
+        description: 'Jalankan migrate:fresh --seed (HATI-HATI: Menghapus semua data database)'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+
+      # 1. Setup PHP & Composer
+      - name: 🐘 Setup PHP 8.3
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, xml, ctype, iconv, intl, pdo, pdo_mysql, zip, bcmath, fileinfo, gd
+          coverage: none
+
+      - name: 📦 Install Composer Dependencies (Production)
+        run: |
+          composer install --no-dev --prefer-dist --optimize-autoloader --no-interaction --no-progress
+
+      # 2. Setup Node.js & Compile Assets (Vite)
+      - name: 🟢 Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: 🔨 Install NPM Dependencies & Build Assets
+        run: |
+          npm ci
+          npm run build
+
+      # 3. Bersihkan file yang tidak diperlukan di server
+      - name: 🧹 Cleanup Unnecessary Files
+        run: |
+          rm -rf node_modules
+          rm -rf .github
+          rm -rf tests
+
+      # 4. Sync Files via Rsync over SSH (Hanya update berkas yang berubah)
+      - name: 🚀 Incremental Sync Files via Rsync over SSH
+        env:
+          SSH_PASSWORD: ${{ secrets.HOSTINGER_SSH_PASSWORD }}
+          SSH_USER: ${{ secrets.HOSTINGER_SSH_USER }}
+          SSH_HOST: ${{ secrets.HOSTINGER_SSH_HOST }}
+          SSH_PORT: ${{ secrets.HOSTINGER_SSH_PORT || '65002' }}
+          RAW_TARGET: ${{ secrets.HOSTINGER_TARGET_DIR || 'public_html' }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq sshpass rsync
+          export SSHPASS="$SSH_PASSWORD"
+          
+          # Deteksi otomatis folder domain di Hostinger (domains/pmi.oproject.id/public_html)
+          DETECTED_PATH=$(sshpass -e ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$SSH_USER@$SSH_HOST" '
+            if [ -d "/home/'"$SSH_USER"'/domains/pmi.oproject.id/public_html" ]; then
+              echo "/home/'"$SSH_USER"'/domains/pmi.oproject.id/public_html"
+            elif [ -d "/home/'"$SSH_USER"'/domains" ] && [ "$(ls -A /home/'"$SSH_USER"'/domains 2>/dev/null)" ]; then
+              DOM_NAME=$(ls -1 /home/'"$SSH_USER"'/domains | head -n 1)
+              if [ -d "/home/'"$SSH_USER"'/domains/$DOM_NAME/public_html" ]; then
+                echo "/home/'"$SSH_USER"'/domains/$DOM_NAME/public_html"
+              fi
+            fi
+          ')
+          
+          if [ -n "$DETECTED_PATH" ]; then
+            TARGET_PATH="${DETECTED_PATH%/}/"
+          else
+            CLEAN_TARGET="${RAW_TARGET#/}"
+            if [[ "$CLEAN_TARGET" == home/* ]]; then
+              TARGET_PATH="/$CLEAN_TARGET"
+            else
+              TARGET_PATH="/home/$SSH_USER/${CLEAN_TARGET}"
+            fi
+            TARGET_PATH="${TARGET_PATH%/}/"
+          fi
+          
+          echo "=========================================="
+          echo "📡 Menghubungkan ke Hostinger: $SSH_USER@$SSH_HOST:$SSH_PORT"
+          echo "📁 Target Direktori: $TARGET_PATH"
+          echo "=========================================="
+          
+          # Sync berkas secara inkremental (hanya file yang berubah, menjaga storage & .env tetap aman)
+          sshpass -e rsync -avz --delete \
+            -e "ssh -p $SSH_PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            --exclude="/.git/" \
+            --exclude="/.github/" \
+            --exclude="/.env" \
+            --exclude="/node_modules/" \
+            --exclude="/tests/" \
+            --exclude="/storage/app/public/*" \
+            --exclude="/storage/logs/*" \
+            --exclude="/storage/framework/cache/*" \
+            --exclude="/storage/framework/sessions/*" \
+            --exclude="/storage/framework/views/*" \
+            ./ "$SSH_USER@$SSH_HOST:$TARGET_PATH"
+            
+          echo "=========================================="
+          echo "✅ Sinkronisasi Inkremental Selesai!"
+          echo "=========================================="
+
+      # 5. Jalankan Artisan Commands di Hostinger via SSH
+      - name: ⚙️ Run Post-Deployment Commands on Hostinger
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.HOSTINGER_SSH_HOST }}
+          username: ${{ secrets.HOSTINGER_SSH_USER }}
+          password: ${{ secrets.HOSTINGER_SSH_PASSWORD }}
+          port: ${{ secrets.HOSTINGER_SSH_PORT || 65002 }}
+          script: |
+            # Deteksi direktori domain
+            if [ -d "/home/${{ secrets.HOSTINGER_SSH_USER }}/domains/pmi.oproject.id/public_html" ]; then
+              cd "/home/${{ secrets.HOSTINGER_SSH_USER }}/domains/pmi.oproject.id/public_html"
+            elif [ -d "/home/${{ secrets.HOSTINGER_SSH_USER }}/domains" ] && [ "$(ls -A /home/${{ secrets.HOSTINGER_SSH_USER }}/domains 2>/dev/null)" ]; then
+              DOM_NAME=$(ls -1 /home/${{ secrets.HOSTINGER_SSH_USER }}/domains | head -n 1)
+              cd "/home/${{ secrets.HOSTINGER_SSH_USER }}/domains/$DOM_NAME/public_html"
+            elif [ -d "/home/${{ secrets.HOSTINGER_SSH_USER }}/public_html" ]; then
+              cd "/home/${{ secrets.HOSTINGER_SSH_USER }}/public_html"
+            else
+              cd public_html || cd ~/public_html
+            fi
+            
+            echo "📂 Direktori aktif saat ini: $(pwd)"
+            
+            # Cari binary PHP 8.3+ di Hostinger
+            if command -v php8.3 > /dev/null 2>&1; then
+              PHP_BIN="php8.3"
+            elif [ -f "/usr/bin/php8.3" ]; then
+              PHP_BIN="/usr/bin/php8.3"
+            elif [ -f "/usr/local/bin/php8.3" ]; then
+              PHP_BIN="/usr/local/bin/php8.3"
+            elif [ -f "/opt/alt/php83/usr/bin/php" ]; then
+              PHP_BIN="/opt/alt/php83/usr/bin/php"
+            elif [ -f "/usr/local/php83/bin/php" ]; then
+              PHP_BIN="/usr/local/php83/bin/php"
+            else
+              PHP_BIN="php"
+            fi
+            
+            echo "🐘 Menggunakan PHP binary: $($PHP_BIN -v | head -n 1)"
+            
+            # Buat link storage jika belum ada
+            $PHP_BIN artisan storage:link || true
+            
+            # Jalankan database migration standar inkremental (Aman untuk data production)
+            echo "📦 Menjalankan migrate standar inkremental (Aman, tidak menghapus data)..."
+            $PHP_BIN artisan migrate --force
+            
+            # Verifikasi jumlah akun di database
+            echo "👥 Daftar Akun di Database:"
+            $PHP_BIN artisan tinker --execute="foreach(\App\Models\User::all() as \$u) { echo ' - ' . \$u->email . ' [' . \$u->role->value . ']' . PHP_EOL; }"
+            
+            # Optimasi cache Laravel
+            $PHP_BIN artisan optimize:clear
+            $PHP_BIN artisan config:cache
+            $PHP_BIN artisan route:cache
+            $PHP_BIN artisan view:cache
+            
+            # Set permission folder storage & cache
+            chmod -R 775 storage bootstrap/cache
+            
+            echo "✨ Deploy Inkremental Berhasil Selesai!"
